@@ -9,14 +9,17 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
 
+	"github.com/anuvu/disko"
+	"github.com/anuvu/disko/linux"
 	"github.com/apex/log"
 	"github.com/jsipprell/keyctl"
-	"github.com/urfave/cli"
 )
 
 var nativeEndian binary.ByteOrder
@@ -38,17 +41,72 @@ func init() {
 type tpm2V3Context struct {
 	dataDir        string  // our data directory under which we keep files
 	keyClass       string  // release, dev, or snakeoil
-	adminPwd        string  // provisioned tpm admin password
+	adminPwd       string  // provisioned tpm admin password
 	pubkeyName     string  // pubkeyname from tpm2_loadexternal
 	pubkeyContext  string  // pubkeycontext from tpm2_loadexternal
 	tmpDir         string  // directory for tpm2 sessions and other io
 	sessionFile    string
 	Keyctx         string  // pathname to file from tpm2_createprimary
+	PlainPart      *DiskPart // Disk partition with plaintext provisioned data
+	CryptPart      *DiskPart // Disk partition with encrypted provisioned data
 }
 
-// We're not doing partitioning yet.  Just expect "/signdata"
-func mountPlaintextPartition() (string, error) {
-	return "/", nil
+type DiskPart struct {
+	Disk disko.Disk
+	PNum uint
+}
+
+func pathForPartition(p *DiskPart) string {
+	endsWithNum := regexp.MustCompile("[0-9]$")
+	diskName := p.Disk.Name
+	num := p.PNum
+	sep := ""
+	if endsWithNum.MatchString(diskName) {
+		sep = "p"
+	}
+	return fmt.Sprintf("/dev/%s%s%d", diskName, sep, num)
+}
+
+func (t *tpm2V3Context) mountPlaintextPartition() error {
+	// If /pcr7data exists, use it.  Otherwise, look for a disk partition
+	// with PBFPartitionTypeID and mount it
+	if PathExists(SignDataDir) {
+		return nil
+	}
+
+	if t.PlainPart == nil {
+		return fmt.Errorf("No signdata found")
+	}
+
+	err := os.Mkdir(SignDataDir, 0744)
+	if err != nil {
+		return fmt.Errorf("Failed creating signdata directory: %w", err)
+	}
+
+	dest := "/factory/pbf"
+	err = os.MkdirAll(dest, 0755)
+	if err != nil {
+		return fmt.Errorf("Failed creating /factory/pbf: %w", err)
+	}
+
+	src := pathForPartition(t.PlainPart)
+	err = syscall.Mount(src, dest, "ext4", syscall.MS_RDONLY, "")
+	if err != nil {
+		return fmt.Errorf("Failed mounting PBF (%s) onto %s: %w", src, SignDataDir, err)
+	}
+
+	src = filepath.Join(dest, "pcr7data")
+	dest = SignDataDir
+	err = os.MkdirAll(SignDataDir, 0755)
+	if err != nil {
+		return fmt.Errorf("Failed creating %s: %w", SignDataDir, err)
+	}
+	err = syscall.Mount(src, dest, "", syscall.MS_BIND, "")
+	if err != nil {
+		return fmt.Errorf("Error bind mounting signdata: %w", err)
+	}
+
+	return nil
 }
 
 // /signdata/pcr7/ may have "policy-1", "policy-2", etc.  If
@@ -80,15 +138,14 @@ func getPoldir(pdir string) string {
 	return dirname
 }
 
-// ChooseSignData:
-// Input argument:
-//    pbfMount: the sb-tpm plaintext partition (pbf) is
+// ChooseSignData: assumes that someone has placed the pcr7data
+//  under SignDataDir (/pcr7data).  Finds the pcr7 data for the
+//  running host+shim+kernel.
 // Returns:
 //    1. the signdata directory name for this host's pcr7 value
 //    2. the type of key this was signed by (e.g. "production")
-func ChooseSignData(pbfMount string) (string, string, error) {
-	signDir := filepath.Join(pbfMount, "pcr7data")
-	polDir := getPoldir(signDir)
+func ChooseSignData() (string, string, error) {
+	polDir := getPoldir(SignDataDir)
 	if polDir == "" {
 		return "", "", fmt.Errorf("no policy dir found")
 	}
@@ -119,6 +176,58 @@ func ChooseSignData(pbfMount string) (string, string, error) {
 	return pcr7Dir, info.Class, nil
 }
 
+func (t *tpm2V3Context) findDisks() error {
+	hasTable := func(d disko.Disk) bool {
+		return d.Table != disko.TableNone
+	}
+
+	mysys := linux.System()
+	disks, err := mysys.ScanAllDisks(hasTable)
+	if err != nil {
+		return fmt.Errorf("Failed scanning disks: %w", err)
+	}
+
+	for _, d := range disks {
+		if d.Table != disko.GPT {
+			continue
+		}
+		for _, p := range d.Partitions {
+			if p.Type == PBFPartitionTypeID && t.PlainPart == nil {
+				t.PlainPart = &DiskPart{d, p.Number}
+			} else if p.Type == SBFPartitionTypeID && t.CryptPart == nil {
+				t.CryptPart = &DiskPart{d, p.Number}
+			}
+		}
+	}
+
+	if t.PlainPart == nil {
+		return nil
+	}
+
+	if !PathExists("/factory") {
+		dest := "/factory/pbf"
+		err = os.MkdirAll(dest, 0755)
+		if err != nil {
+			return fmt.Errorf("Failed creating /factory/pbf: %w", err)
+		}
+
+		src := pathForPartition(t.PlainPart)
+		err = syscall.Mount(src, dest, "ext4", syscall.MS_RDONLY, "")
+		if err != nil {
+			return fmt.Errorf("Failed mounting PBF (%s) onto %s: %w", src, SignDataDir, err)
+		}
+
+		src = filepath.Join(dest, "pcr7data")
+		dest = SignDataDir
+		err = syscall.Mount(src, dest, "", syscall.MS_BIND, "")
+		if err != nil {
+			return fmt.Errorf("Error bind mounting signdata: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func NewTpm2() (*tpm2V3Context, error) {
 	t := &tpm2V3Context{}
 	tmpd, err := ioutil.TempDir("/run", "atx-trustroot-*")
@@ -126,12 +235,14 @@ func NewTpm2() (*tpm2V3Context, error) {
 		return t, fmt.Errorf("failed to create tempdir: %w", err)
 	}
 
-	pbfMount, err := mountPlaintextPartition()
+	t.findDisks()
+
+	err = t.mountPlaintextPartition()
 	if err != nil {
 		return t, err
 	}
 
-	dataDir, keyClass, err := ChooseSignData(pbfMount)
+	dataDir, keyClass, err := ChooseSignData()
 	if err != nil {
 		return t, fmt.Errorf("failed finding pcr7 data: %w", err)
 	}
@@ -237,14 +348,151 @@ func (t *tpm2V3Context) ExtendPCR7() error {
 	return t.extendPCR7()
 }
 
-func (t *tpm2V3Context) TpmGenPolicy(ctx *cli.Context) error {
-	return TpmGenPolicy(ctx)
+func newPbfSpbf() (DiskPart, DiskPart, error) {
+	commonCrit := func(d disko.Disk) bool {
+		return d.Size >= 1*GiB && d.Attachment != disko.USB
+	}
+
+	searches := []func(disko.Disk) bool{
+		func(d disko.Disk) bool {
+			return commonCrit(d) && d.Type == disko.SSD && d.Attachment == disko.ATA
+		},
+		func(d disko.Disk) bool {
+			return commonCrit(d) && d.Type == disko.SSD
+		},
+		func(d disko.Disk) bool {
+			return commonCrit(d) && d.Type == disko.HDD
+		},
+	}
+
+	mysys := linux.System()
+	matchAll := func(d disko.Disk) bool {
+		return true
+	}
+
+	disks, err := mysys.ScanAllDisks(matchAll)
+	if err != nil {
+		return DiskPart{}, DiskPart{}, err
+	}
+
+	names := []string{}
+	for n := range disks {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	for _, filter := range searches {
+		for _, n := range names {
+			d := disks[n]
+			if filter(d) {
+				return DiskPart{Disk: d, PNum: 1},
+					DiskPart{Disk: d, PNum: 2},
+					nil
+			}
+		}
+	}
+
+	return DiskPart{}, DiskPart{}, fmt.Errorf("Did not find suitable space for partitions")
+}
+
+func (t *tpm2V3Context) PartitionForTPM(luksPassphrase string) error {
+	pbf, sbf, err := newPbfSpbf()
+	if err != nil {
+		return err
+	}
+
+	// create and format the plain partition
+	const pstart, psize = uint64(4 * MiB), uint64(64 * MiB)
+
+	part := disko.Partition{
+		Start:  pstart,
+		Last:   pstart + psize - 1,
+		ID:     disko.GenGUID(),
+		Type:   PBFPartitionTypeID,
+		Name:   PBFPartitionName,
+		Number: pbf.PNum,
+	}
+
+	log.Debugf("Creating partition %s", diskPartInfo(pbf.Disk, part))
+	mysys := linux.System()
+	if err := mysys.CreatePartition(pbf.Disk, part); err != nil {
+		log.Errorf("Failed to create partition number %d on %s", pbf.PNum, pbf.Disk.Path)
+		return err
+	}
+
+	ppartPath := pathForPartition(&pbf)
+	if stdout, stderr, rc := runCapture("mkfs.ext4", ppartPath); rc != 0 {
+		return fmt.Errorf("Failed to mkfs.ext4 %s [%d]:\n  out: %s\n  err: %s\n",
+			ppartPath, rc, stdout, stderr)
+	}
+
+	dest := "/factory/secure"
+	err = EnsureDir(dest)
+	if err != nil {
+		return err
+	}
+	err = syscall.Mount(ppartPath, dest, "ext4", 0, "")
+	if err != nil {
+		return fmt.Errorf("Failed mounting PBF (%s) onto %s: %w", ppartPath, dest, err)
+	}
+
+	dest = filepath.Join(dest, SignDataDir)
+	err = CopyFiles(SignDataDir, dest)
+	if err != nil {
+		return fmt.Errorf("Failed saving pcr7data onto new PBF: %w", err)
+	}
+
+	// create, luks-format, and format the encrypted partition
+	const cstart, csize = uint64(68 * MiB), uint64(256 * MiB)
+	cpart := disko.Partition{
+		Start:  cstart,
+		Last:   cstart + csize - 1,
+		ID:     disko.GenGUID(),
+		Type:   SBFPartitionTypeID,
+		Name:   SBFPartitionName,
+		Number: sbf.PNum,
+	}
+	log.Debugf("Creating partition %s", diskPartInfo(sbf.Disk, cpart))
+	if err := mysys.CreatePartition(sbf.Disk, cpart); err != nil {
+		log.Errorf("Failed to create partition number %d on %s", sbf.PNum, sbf.Disk.Path)
+		return err
+	}
+
+	partPath := pathForPartition(&sbf)
+	name := SBFMapperName
+	mpath := filepath.Join("/dev/mapper", name)
+	log.Debugf("luks Formatting %s", partPath)
+	if err := luksFormatLuks2(partPath, luksPassphrase); err != nil {
+		return err
+	}
+
+	if err := luksOpen(partPath, luksPassphrase, name); err != nil {
+		return err
+	}
+
+	if stdout, stderr, rc := runCapture("mkfs.ext4", mpath); rc != 0 {
+		return fmt.Errorf("Failed to mkfs.ext4 %s [%d]:\n  out: %s\n  err: %s\n",
+			mpath, rc, stdout, stderr)
+	}
+
+	if stdout, stderr, rc := runCapture("cryptsetup", "close", name); rc != 0 {
+		return fmt.Errorf("Failed to close luks device: %s [%d]:\n  out: %s\n  err: %s\n",
+			name, rc, stdout, stderr)
+	}
+
+	t.PlainPart = &pbf
+	t.CryptPart = &sbf
+	return nil
 }
 
 func (t *tpm2V3Context) Provision(certPath, keyPath string) error {
 	err := HWRNGSeed()
 	if err != nil {
 		return fmt.Errorf("Failed to seed hardware random: %v", err)
+	}
+
+	if t.CryptPart != nil || t.PlainPart != nil {
+		return fmt.Errorf("Cannot provision: disks have PBF or SBF")
 	}
 
 	certBytes, err := os.ReadFile(certPath)
@@ -300,7 +548,10 @@ func (t *tpm2V3Context) Provision(certPath, keyPath string) error {
 		return err
 	}
 
-	// TODO = partition and create the sbf with sbsPassphrase
+	err = t.PartitionForTPM(sbsPassphrase)
+	if err != nil {
+		return err
+	}
 
 	pubkeyPath := t.Pubkeypath("luks")
 	err = t.Tpm2LoadExternal(pubkeyPath)
@@ -510,4 +761,11 @@ func (t *tpm2V3Context) PreInstall() error {
 	// TODO - do we need to also copy the manifestCA.pem out of initrd?
 
 	return nil
+}
+
+func diskPartInfo(d disko.Disk, p disko.Partition) string {
+	return fmt.Sprintf("disk=%s (bus=%s serial=%s) partNum=%d size=%dMiB",
+		d.Path,
+		d.UdevInfo.Properties["ID_BUS"], d.UdevInfo.Properties["ID_SERIAL"],
+		p.Number, p.Size()/MiB)
 }

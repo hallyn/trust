@@ -6,7 +6,15 @@ require (
 	github.com/urfave/cli v1.22.5
 )
 
-require github.com/pkg/errors v0.8.1 // indirect
+require (
+	github.com/anuvu/disko v0.0.11 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/plus3it/gorecurcopy v0.0.1 // indirect
+	github.com/rekby/gpt v0.0.0-20200219180433-a930afbc6edc // indirect
+	github.com/rekby/mbr v0.0.0-20190325193910-2b19b9cdeebc // indirect
+	github.com/satori/go.uuid v1.2.0 // indirect
+)
 
 require (
 	github.com/canonical/go-sp800.108-kdf v0.0.0-20210314145419-a3359f2d21b9 // indirect

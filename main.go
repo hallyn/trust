@@ -58,12 +58,7 @@ var tpmPolicyGenCmd = cli.Command{
 }
 
 func doTpmPolicygen(ctx *cli.Context) error {
-	t, err := lib.NewTpm2()
-	if err != nil {
-		return err
-	}
-	defer t.Close()
-	return t.TpmGenPolicy(ctx)
+	return lib.TpmGenPolicy(ctx)
 }
 
 var extendPCR7Cmd = cli.Command{
