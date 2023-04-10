@@ -9,31 +9,53 @@
 
    * Note: I  seem to be hitting a bug with this, where it fails to build the second time.
 
- * get privkey.pem and cert.pem and run 'build-media'
+ * Build a signed manifest pointing at your rfs
 
-   ```
-   keydir="/path/to/keys"
-   ./build-media \
-        --cert=$keydir/manifest/cert.pem  \
-        --key=$keydir/manifest/privkey.pem \
-        out.img \
-        docker://zothub.io/machine/bootkit/bootkit:0.0.5.230327-squashfs \
-        oci:./oci:rootfs-squashfs
     ```
+    ./build-livecd-rfs
+    ```
+    or if you're doing things more custom,
+    ```
+    trust keyset add mostest
+    trust project add mostest livecd
+    ./build-livecd-rfs --project=mostest:livecd \
+          --layer oci:oci:livecd-rootfs-squashfs
+    ````
+    The results will be a complete zot layout under ./zot-cache.
+
+ * Build the boot media
+
+    ```
+    mosb --debug mkboot --cdrom snakeoil:default docker://localhost:59111/machine/livecd:1.0.0 livecd.iso
+    ```
+    (Note in this case we provide docker:// to disambiguate from oci images)
+    (Note - add --boot-from-remote argument to not copy the manifest and
+     layers to the iso, and tell the livecd to boot from a remote repo)
 
  * boot the usb media. 
  
-   * atomix-vm-builder wants qcow2 format, so convert to qcow2
-   * build-media left 'ovmf-vars.fd' and 'ovmf-code.fd' in same dir as out.img
-
+   ```
+   machine init livecd << EOF
+    name: livecd
+    type: kvm
+    ephemeral: false
+    description: A fresh VM booting trust LiveCD in SecureBoot mode with TPM
+    config:
+      name: trust
+      uefi: true
+      uefi-vars: /home/serge/src/project-machine/trust/live/ovmf-vars.fd
+      cdrom: /home/serge/src/project-machine/trust/live/livecd.iso
+      boot: cdrom
+      tpm: true
+      gui: true
+      serial: true
+      tpm-version: 2.0
+      secure-boot: true
+      disks:
+          - file: /home/serge/src/project-machine/trust/live/livecd.qcow2
+            type: ssd
+            size: 20G
+   EOF
+   machine start livecd
+   machine gui livecd
     ```
-    rm -f out.qcow2 
-    qemu-img create -fqcow2 -b out.img -Fraw out.qcow2 
-    atomix-vm-builder run \
-       --usb-hdd-path=out.qcow2 \
-       --tpm --tpm-version=2.0 \
-       --secure-boot --uefi \
-       --uefi-vars=ovmf-vars.fd \
-       --uefi-code=ovmf-code.fd \
-       --num-hdd=0 --num-ssd=0 \
-       --kvmopts="-echr 0x05 -device VGA -vnc :9000"
