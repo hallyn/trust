@@ -30,9 +30,7 @@ done
 
 if [ -z "$LAYER" ]; then
 	echo "Using default layer: $LAYER, copying it locally if needed"
-	LAYER="oci:oci:bootkit-squashfs"
-	remote="docker://zothub.io/machine/bootkit/bootkit:0.0.5.230327-squashfs"
-	skopeo copy $remote $LAYER
+	LAYER="oci:oci:rootfs-squashfs"
 fi
 
 echo "building project $project layer $LAYER"
